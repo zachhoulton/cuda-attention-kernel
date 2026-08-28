@@ -1,5 +1,10 @@
 #include "flash_attention_utils.cuh"
 
+#include <cfloat>
+#include <cmath>
+
+#define MAX_SEQ_LEN 256
+
 __global__ void flash_attention_kernel(
     const float* q,
     const float* k,
@@ -10,15 +15,67 @@ __global__ void flash_attention_kernel(
     int seq_len,
     int head_dim,
     bool causal) {
+    
+    // Which token is this block assigned to
+    const int query_index = blockIdx.x;
 
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = batch * heads * seq_len * head_dim;
-
-    if (idx < total) {
-        out[idx] = 0.0f;
+    // Which output feature is this thread assigned to
+    const int output_dim = threadIdx.x;
+    
+    // Guard against launching more blocks/threads than needed
+    if (query_index >= seq_len || output_dim >= head_dim) {
+        return;
     }
+
+    const int query_offset = query_index * head_dim;
+    float max_score = -FLT_MAX;
+
+    // Compute Q[query_index] * K[key_index] and scale by 1/sqrt(head_dim) to find the max score
+    for (int key_index = 0; key_index < seq_len; ++key_index) {
+
+        // Skip any key that comes after query token if causal (GPT-style)
+        if (causal && key_index > query_index) {
+            continue;
+        }
+
+        float score = 0.0f;
+        const int key_offset = key_index * head_dim;
+        for (int d = 0; d < head_dim; ++d) {
+            score += q[query_offset + d] * k[key_offset + d];
+        }
+
+        score /= sqrtf(static_cast<float>(head_dim));
+        // Used to prevent exp(score) from overflowing
+        if (score > max_score) {
+            max_score = score;
+        }
+    }
+
+    float denominator = 0.0f;
+    float weighted_value = 0.0f;
+
+    // Recompute scores to form the softmax and weighted sum
+    for (int key_index = 0; key_index < seq_len; ++key_index) {
+        if (causal && key_index > query_index) {
+            continue;
+        }
+
+        float score = 0.0f;
+        const int key_offset = key_index * head_dim;
+        for (int d = 0; d < head_dim; ++d) {
+            score += q[query_offset + d] * k[key_offset + d];
+        }
+
+        score /= sqrtf(static_cast<float>(head_dim));
+        const float weight = expf(score - max_score);
+        denominator += weight;
+        weighted_value += weight * v[key_offset + output_dim];
+    }
+
+    out[query_offset + output_dim] = weighted_value / denominator;
 }
 
+// Host-side launcher for forward pass
 void flash_attention_forward(
     const float* d_q,
     const float* d_k,
@@ -26,9 +83,18 @@ void flash_attention_forward(
     float* d_out,
     const AttentionConfig& config) {
 
-    const int total = static_cast<int>(element_count(config));
-    const int threads = 256;
-    const int blocks = ceil_div(total, threads);
+    if (config.batch != 1 || config.heads != 1) {
+        throw std::invalid_argument("The first kernel supports batch=1 and heads=1 only");
+    }
+    if (config.seq_len > MAX_SEQ_LEN) {
+        throw std::invalid_argument("seq_len exceeds MAX_SEQ_LEN");
+    }
+    if (config.head_dim > 1024) {
+        throw std::invalid_argument("head_dim exceeds the CUDA block thread limit");
+    }
+
+    const int threads = config.head_dim;
+    const int blocks = config.seq_len;
 
     flash_attention_kernel<<<blocks, threads>>>(
         d_q,
