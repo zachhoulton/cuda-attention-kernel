@@ -4,6 +4,7 @@
 #include <cmath>
 
 #define MAX_SEQ_LEN 256
+#define KEY_TILE_SIZE 4
 
 __global__ void flash_attention_kernel(
     const float* q,
@@ -31,23 +32,26 @@ __global__ void flash_attention_kernel(
     float max_score = -FLT_MAX;
 
     // Compute Q[query_index] * K[key_index] and scale by 1/sqrt(head_dim) to find the max score
-    for (int key_index = 0; key_index < seq_len; ++key_index) {
+    for (int tile_start = 0; tile_start < seq_len; tile_start += KEY_TILE_SIZE) {
+        const int tile_end = min(tile_start + KEY_TILE_SIZE, seq_len);
+        for (int key_index = tile_start; key_index < tile_end; ++key_index) {
 
-        // Skip any key that comes after query token if causal (GPT-style)
-        if (causal && key_index > query_index) {
-            continue;
-        }
+            // Skip any key that comes after query token if causal (GPT-style)
+            if (causal && key_index > query_index) {
+                continue;
+            }
 
-        float score = 0.0f;
-        const int key_offset = key_index * head_dim;
-        for (int d = 0; d < head_dim; ++d) {
-            score += q[query_offset + d] * k[key_offset + d];
-        }
+            float score = 0.0f;
+            const int key_offset = key_index * head_dim;
+            for (int d = 0; d < head_dim; ++d) {
+                score += q[query_offset + d] * k[key_offset + d];
+            }
 
-        score /= sqrtf(static_cast<float>(head_dim));
-        // Used to prevent exp(score) from overflowing
-        if (score > max_score) {
-            max_score = score;
+            score /= sqrtf(static_cast<float>(head_dim));
+            // Used to prevent exp(score) from overflowing
+            if (score > max_score) {
+                max_score = score;
+            }
         }
     }
 
@@ -55,21 +59,24 @@ __global__ void flash_attention_kernel(
     float weighted_value = 0.0f;
 
     // Recompute scores to form the softmax and weighted sum
-    for (int key_index = 0; key_index < seq_len; ++key_index) {
-        if (causal && key_index > query_index) {
-            continue;
-        }
+    for (int tile_start = 0; tile_start < seq_len; tile_start += KEY_TILE_SIZE) {
+        const int tile_end = min(tile_start + KEY_TILE_SIZE, seq_len);
+        for (int key_index = tile_start; key_index < tile_end; ++key_index) {
+            if (causal && key_index > query_index) {
+                continue;
+            }
 
-        float score = 0.0f;
-        const int key_offset = key_index * head_dim;
-        for (int d = 0; d < head_dim; ++d) {
-            score += q[query_offset + d] * k[key_offset + d];
-        }
+            float score = 0.0f;
+            const int key_offset = key_index * head_dim;
+            for (int d = 0; d < head_dim; ++d) {
+                score += q[query_offset + d] * k[key_offset + d];
+            }
 
-        score /= sqrtf(static_cast<float>(head_dim));
-        const float weight = expf(score - max_score);
-        denominator += weight;
-        weighted_value += weight * v[key_offset + output_dim];
+            score /= sqrtf(static_cast<float>(head_dim));
+            const float weight = expf(score - max_score);
+            denominator += weight;
+            weighted_value += weight * v[key_offset + output_dim];
+        }
     }
 
     out[query_offset + output_dim] = weighted_value / denominator;
