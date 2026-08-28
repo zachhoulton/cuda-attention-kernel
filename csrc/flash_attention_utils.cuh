@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <stdexcept>
 
+// To be used inside helper functions
 #define CUDA_CHECK(call)                                                      \
     do {                                                                      \
         cudaError_t err = (call);                                             \
@@ -15,12 +16,12 @@
     } while (0)
 
 struct AttentionConfig {
-    int batch;
-    int heads;
-    int seq_len;
-    int head_dim;
-    int block_size;
-    bool causal;
+    int batch;  // How many sequences at once
+    int heads;  // Number of attention heads
+    int seq_len;    // Sequence length
+    int head_dim;   // Dim. of each Q/K/V vector per token
+    int block_size; // Tiling size
+    bool causal;    // Whether to apply causal masking
 };
 
 inline int ceil_div(int x, int y) {
