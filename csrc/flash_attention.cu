@@ -166,9 +166,9 @@ int main() {
     float* h_out = (float*)malloc(bytes);
 
     for (size_t i = 0; i < element_count(cfg); ++i) {
-        h_q[i] = 1.0f;
-        h_k[i] = 0.5f;
-        h_v[i] = 2.0f;
+        h_q[i] = 0.1f + 0.01f * (i % 100);
+        h_k[i] = 0.2f + 0.02f * (i % 100);
+        h_v[i] = 0.3f + 0.03f * (i % 100);
     }
 
     float *d_q, *d_k, *d_v, *d_out;
@@ -177,6 +177,7 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_v, bytes));
     CUDA_CHECK(cudaMalloc(&d_out, bytes));
 
+    // Test 1: Non-causal attention
     CUDA_CHECK(cudaMemcpy(d_q, h_q, bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_k, h_k, bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_v, h_v, bytes, cudaMemcpyHostToDevice));
@@ -185,7 +186,27 @@ int main() {
 
     CUDA_CHECK(cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost));
 
-    std::printf("Flash attention scaffold executed successfully. Output[0] = %f\n", h_out[0]);
+    std::printf("TEST_NONCAUSAL_OUTPUT_START\n");
+    for (int i = 0; i < cfg.seq_len * cfg.head_dim; i++) {
+        std::printf("%.8f ", h_out[i]);
+        if ((i + 1) % cfg.head_dim == 0) std::printf("\n");
+    }
+    std::printf("TEST_NONCAUSAL_OUTPUT_END\n");
+
+    // Test 2: Causal attention
+    cfg.causal = true;
+    float* h_out_causal = (float*)malloc(bytes);
+
+    flash_attention_forward(d_q, d_k, d_v, d_out, cfg);
+
+    CUDA_CHECK(cudaMemcpy(h_out_causal, d_out, bytes, cudaMemcpyDeviceToHost));
+
+    std::printf("TEST_CAUSAL_OUTPUT_START\n");
+    for (int i = 0; i < cfg.seq_len * cfg.head_dim; i++) {
+        std::printf("%.8f ", h_out_causal[i]);
+        if ((i + 1) % cfg.head_dim == 0) std::printf("\n");
+    }
+    std::printf("TEST_CAUSAL_OUTPUT_END\n");
 
     cudaFree(d_q);
     cudaFree(d_k);
@@ -195,6 +216,7 @@ int main() {
     free(h_k);
     free(h_v);
     free(h_out);
+    free(h_out_causal);
 
     return 0;
 }
