@@ -5,6 +5,7 @@
 
 #define MAX_SEQ_LEN 256
 #define KEY_TILE_SIZE 4
+#define QUERY_BLOCK_SIZE 2
 
 __global__ void flash_attention_kernel(
     const float* q,
@@ -17,11 +18,11 @@ __global__ void flash_attention_kernel(
     int head_dim,
     bool causal) {
     
-    // Which token is this block assigned to
-    const int query_index = blockIdx.x;
-
-    // Which output feature is this thread assigned to
-    const int output_dim = threadIdx.x;
+    // Which query block and which query row within it
+    const int query_block_start = blockIdx.x * QUERY_BLOCK_SIZE;
+    const int query_offset_in_block = threadIdx.x / head_dim;
+    const int output_dim = threadIdx.x % head_dim;
+    const int query_index = query_block_start + query_offset_in_block;
     
     // Guard against launching more blocks/threads than needed
     if (query_index >= seq_len || output_dim >= head_dim) {
@@ -134,13 +135,13 @@ void flash_attention_forward(
         throw std::invalid_argument("head_dim exceeds the CUDA block thread limit");
     }
 
-    const int threads = config.head_dim;
-    const int blocks = config.seq_len;
+    const int blocks = (config.seq_len + QUERY_BLOCK_SIZE - 1) / QUERY_BLOCK_SIZE;
+    const int threads_per_block = QUERY_BLOCK_SIZE * config.head_dim;
     // 2 * because storing both K and V tiles
     const size_t shared_bytes =
         2 * KEY_TILE_SIZE * config.head_dim * sizeof(float);
 
-    flash_attention_kernel<<<blocks, threads, shared_bytes>>>(
+    flash_attention_kernel<<<blocks, threads_per_block, shared_bytes>>>( 
         d_q,
         d_k,
         d_v,
