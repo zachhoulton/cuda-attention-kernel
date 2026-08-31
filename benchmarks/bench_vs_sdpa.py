@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Comparison: CUDA flash-attention forward+backward kernels vs
-torch.nn.functional.scaled_dot_product_attention
+Comparison: CUDA flash-attention forward+backward kernels vs both
+torch.nn.functional.scaled_dot_product_attention and naive PyTorch attention
 """
 
+import math
 import re
 import subprocess
 from pathlib import Path
@@ -99,15 +100,69 @@ def benchmark_sdpa_backward(seq_len):
     return start.elapsed_time(end) / TIMED_ITERS
 
 
-def print_comparison(title, custom_results, sdpa_results):
-    print(f"\n=== {title} comparison ===")
-    header = f"{'seq_len':<10} {'custom(ms)':<12} {'sdpa(ms)':<12} {'custom GFLOP/s':<16} {'sdpa GFLOP/s':<14} {'sdpa speedup':<12}"
+def naive_attention(q, k, v):
+    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
+    probs = torch.softmax(scores, dim=-1)
+    return torch.matmul(probs, v)
+
+
+def benchmark_naive_forward(seq_len):
+    device = torch.device("cuda")
+    q = torch.randn(BATCH, HEADS, seq_len, HEAD_DIM, device=device, dtype=torch.float32)
+    k = torch.randn(BATCH, HEADS, seq_len, HEAD_DIM, device=device, dtype=torch.float32)
+    v = torch.randn(BATCH, HEADS, seq_len, HEAD_DIM, device=device, dtype=torch.float32)
+
+    for _ in range(WARMUP_ITERS):
+        naive_attention(q, k, v)
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(TIMED_ITERS):
+        naive_attention(q, k, v)
+    end.record()
+    torch.cuda.synchronize()
+
+    return start.elapsed_time(end) / TIMED_ITERS
+
+
+def benchmark_naive_backward(seq_len):
+    device = torch.device("cuda")
+    q = torch.randn(BATCH, HEADS, seq_len, HEAD_DIM, device=device, dtype=torch.float32, requires_grad=True)
+    k = torch.randn(BATCH, HEADS, seq_len, HEAD_DIM, device=device, dtype=torch.float32, requires_grad=True)
+    v = torch.randn(BATCH, HEADS, seq_len, HEAD_DIM, device=device, dtype=torch.float32, requires_grad=True)
+
+    out = naive_attention(q, k, v)
+    grad_output = torch.randn_like(out)
+
+    for _ in range(WARMUP_ITERS):
+        torch.autograd.grad(out, (q, k, v), grad_outputs=grad_output, retain_graph=True)
+    torch.cuda.synchronize()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(TIMED_ITERS):
+        torch.autograd.grad(out, (q, k, v), grad_outputs=grad_output, retain_graph=True)
+    end.record()
+    torch.cuda.synchronize()
+
+    return start.elapsed_time(end) / TIMED_ITERS
+
+
+def print_comparison(title, other_label, custom_results, other_results):
+    print(f"\n=== {title}: custom vs {other_label} ===")
+    header = f"{'seq_len':<10} {'custom(ms)':<12} {other_label + '(ms)':<12} {'custom GFLOP/s':<16} {other_label + ' GFLOP/s':<16} {'winner':<20}"
     print(header)
     for seq_len in SEQ_LENS:
         c_ms, c_gflops = custom_results.get(seq_len, (float("nan"), float("nan")))
-        s_ms, s_gflops = sdpa_results[seq_len]
-        speedup = c_ms / s_ms if s_ms else float("nan")
-        print(f"{seq_len:<10} {c_ms:<12.4f} {s_ms:<12.4f} {c_gflops:<16.2f} {s_gflops:<14.2f} {speedup:<11.2f}x")
+        o_ms, o_gflops = other_results[seq_len]
+        if c_ms < o_ms:
+            winner = f"custom {o_ms / c_ms:.2f}x faster"
+        else:
+            winner = f"{other_label} {c_ms / o_ms:.2f}x faster"
+        print(f"{seq_len:<10} {c_ms:<12.4f} {o_ms:<12.4f} {c_gflops:<16.2f} {o_gflops:<16.2f} {winner:<20}")
 
 
 def main():
@@ -138,8 +193,28 @@ def main():
         sdpa_backward[seq_len] = (latency_ms, gflops)
         print(f"{seq_len:<10} {latency_ms:<12.4f} {gflops:<12.2f}")
 
-    print_comparison("Forward", custom_forward, sdpa_forward)
-    print_comparison("Backward", custom_backward, sdpa_backward)
+    print("\n=== naive PyTorch ===")
+    print(f"{'seq_len':<10} {'latency(ms)':<12} {'GFLOP/s':<12}")
+    naive_forward = {}
+    for seq_len in SEQ_LENS:
+        latency_ms = benchmark_naive_forward(seq_len)
+        gflops = forward_flops(seq_len) / (latency_ms / 1000.0) / 1e9
+        naive_forward[seq_len] = (latency_ms, gflops)
+        print(f"{seq_len:<10} {latency_ms:<12.4f} {gflops:<12.2f}")
+
+    print("\n=== naive PyTorch: backward ===")
+    print(f"{'seq_len':<10} {'latency(ms)':<12} {'GFLOP/s':<12}")
+    naive_backward = {}
+    for seq_len in SEQ_LENS:
+        latency_ms = benchmark_naive_backward(seq_len)
+        gflops = backward_flops(seq_len) / (latency_ms / 1000.0) / 1e9
+        naive_backward[seq_len] = (latency_ms, gflops)
+        print(f"{seq_len:<10} {latency_ms:<12.4f} {gflops:<12.2f}")
+
+    print_comparison("Forward", "sdpa", custom_forward, sdpa_forward)
+    print_comparison("Forward", "naive", custom_forward, naive_forward)
+    print_comparison("Backward", "sdpa", custom_backward, sdpa_backward)
+    print_comparison("Backward", "naive", custom_backward, naive_backward)
 
     return 0
 
