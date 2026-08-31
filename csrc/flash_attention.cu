@@ -6,7 +6,8 @@
 
 #define MAX_SEQ_LEN 256
 #define KEY_TILE_SIZE 4
-#define QUERY_BLOCK_SIZE 2
+#define QUERY_BLOCK_SIZE 16
+#define MAX_THREADS_PER_BLOCK 1024
 
 __global__ void flash_attention_kernel(
     const float* q,
@@ -26,11 +27,11 @@ __global__ void flash_attention_kernel(
     const int query_offset_in_block = threadIdx.x / head_dim;
     const int output_dim = threadIdx.x % head_dim;
     const int query_index = query_block_start + query_offset_in_block;
-    
-    // Guard against launching more blocks/threads than needed
-    if (batch_idx >= batch || head_idx >= heads || query_index >= seq_len || output_dim >= head_dim) {
+
+    if (batch_idx >= batch || head_idx >= heads) {
         return;
     }
+    const bool is_valid_query = (query_index < seq_len);
 
     const size_t batch_head_offset = (size_t)batch_idx * heads * seq_len * head_dim + (size_t)head_idx * seq_len * head_dim;
     const int query_offset = query_index * head_dim;
@@ -39,9 +40,15 @@ __global__ void flash_attention_kernel(
     float weighted_value = 0.0f;
 
     // __shared__ memory is shared by all threads within a block
-    extern __shared__ float shared_kv[];
-    float* shared_k = shared_kv;
-    float* shared_v = shared_kv + KEY_TILE_SIZE * head_dim;
+    extern __shared__ float shared_mem[];
+    float* shared_q = shared_mem;
+    float* shared_k = shared_q + QUERY_BLOCK_SIZE * head_dim;
+    float* shared_v = shared_k + KEY_TILE_SIZE * head_dim;
+
+    shared_q[threadIdx.x] = is_valid_query
+        ? q[batch_head_offset + query_offset + output_dim]
+        : 0.0f;
+    __syncthreads();
 
     // Process one key/value tile at a time and merge its softmax stats
     for (int tile_start = 0; tile_start < seq_len; tile_start += KEY_TILE_SIZE) {
@@ -69,56 +76,61 @@ __global__ void flash_attention_kernel(
         // Wait until entire tile is written before it's read from
         __syncthreads();
 
-        float tile_max = -FLT_MAX;
-        for (int key_index = tile_start; key_index < tile_end; ++key_index) {
-            if (causal && key_index > query_index) {
-                continue;
+        if (is_valid_query) {
+            const float* my_q = shared_q + query_offset_in_block * head_dim;
+            float tile_max = -FLT_MAX;
+            for (int key_index = tile_start; key_index < tile_end; ++key_index) {
+                if (causal && key_index > query_index) {
+                    continue;
+                }
+
+                float score = 0.0f;
+                const int tile_row = key_index - tile_start;
+                for (int d = 0; d < head_dim; ++d) {
+                    score += my_q[d] * shared_k[tile_row * head_dim + d];
+                }
+
+                score /= sqrtf(static_cast<float>(head_dim));
+                if (score > tile_max) {
+                    tile_max = score;
+                }
             }
 
-            float score = 0.0f;
-            const int tile_row = key_index - tile_start;
-            for (int d = 0; d < head_dim; ++d) {
-                score += q[batch_head_offset + query_offset + d] * shared_k[tile_row * head_dim + d];
+            const float new_max = (running_max > tile_max) ? running_max : tile_max;
+            const float previous_scale =
+                (running_max == -FLT_MAX) ? 0.0f : expf(running_max - new_max);
+            float tile_sum = 0.0f;
+            float tile_weighted_value = 0.0f;
+
+            for (int key_index = tile_start; key_index < tile_end; ++key_index) {
+                if (causal && key_index > query_index) {
+                    continue;
+                }
+
+                float score = 0.0f;
+                const int tile_row = key_index - tile_start;
+                for (int d = 0; d < head_dim; ++d) {
+                    score += my_q[d] * shared_k[tile_row * head_dim + d];
+                }
+
+                score /= sqrtf(static_cast<float>(head_dim));
+                const float weight = expf(score - new_max);
+                tile_sum += weight;
+                tile_weighted_value += weight * shared_v[tile_row * head_dim + output_dim];
             }
 
-            score /= sqrtf(static_cast<float>(head_dim));
-            if (score > tile_max) {
-                tile_max = score;
-            }
+            running_sum = previous_scale * running_sum + tile_sum;
+            weighted_value = previous_scale * weighted_value + tile_weighted_value;
+            running_max = new_max;
         }
-
-        const float new_max = (running_max > tile_max) ? running_max : tile_max;
-        const float previous_scale =
-            (running_max == -FLT_MAX) ? 0.0f : expf(running_max - new_max);
-        float tile_sum = 0.0f;
-        float tile_weighted_value = 0.0f;
-
-        for (int key_index = tile_start; key_index < tile_end; ++key_index) {
-            if (causal && key_index > query_index) {
-                continue;
-            }
-
-            float score = 0.0f;
-            const int tile_row = key_index - tile_start;
-            for (int d = 0; d < head_dim; ++d) {
-                score += q[batch_head_offset + query_offset + d] * shared_k[tile_row * head_dim + d];
-            }
-
-            score /= sqrtf(static_cast<float>(head_dim));
-            const float weight = expf(score - new_max);
-            tile_sum += weight;
-            tile_weighted_value += weight * shared_v[tile_row * head_dim + output_dim];
-        }
-
-        running_sum = previous_scale * running_sum + tile_sum;
-        weighted_value = previous_scale * weighted_value + tile_weighted_value;
-        running_max = new_max;
 
         // All threads must finish reading before the next tile is loaded
         __syncthreads();
     }
 
-    out[batch_head_offset + query_offset + output_dim] = weighted_value / running_sum;
+    if (is_valid_query) {
+        out[batch_head_offset + query_offset + output_dim] = weighted_value / running_sum;
+    }
 }
 
 // Host-side launcher for forward pass
@@ -132,17 +144,17 @@ void flash_attention_forward(
     if (config.seq_len > MAX_SEQ_LEN) {
         throw std::invalid_argument("seq_len exceeds MAX_SEQ_LEN");
     }
-    if (config.head_dim > 1024) {
-        throw std::invalid_argument("head_dim exceeds the CUDA block thread limit");
-    }
 
     const int query_blocks = (config.seq_len + QUERY_BLOCK_SIZE - 1) / QUERY_BLOCK_SIZE;
     const int threads_per_block = QUERY_BLOCK_SIZE * config.head_dim;
+    if (threads_per_block > MAX_THREADS_PER_BLOCK) {
+        throw std::invalid_argument("QUERY_BLOCK_SIZE * head_dim exceeds the CUDA max threads per block (1024)");
+    }
     const dim3 grid(query_blocks, config.heads, config.batch);
-    
-    // 2 * because storing both K and V tiles
+
+    // One tile each for Q, K, and V
     const size_t shared_bytes =
-        2 * KEY_TILE_SIZE * config.head_dim * sizeof(float);
+        (QUERY_BLOCK_SIZE + 2 * KEY_TILE_SIZE) * config.head_dim * sizeof(float);
 
     flash_attention_kernel<<<grid, threads_per_block, shared_bytes>>>( 
         d_q,
