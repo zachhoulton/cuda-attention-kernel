@@ -20,7 +20,6 @@ struct AttentionConfig {
     int heads;  // Number of attention heads
     int seq_len;    // Sequence length
     int head_dim;   // Dim. of each Q/K/V vector per token
-    int block_size; // Tiling size
     bool causal;    // Whether to apply causal masking
 };
 

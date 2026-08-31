@@ -172,7 +172,7 @@ void flash_attention_forward(
 }
 
 int main() {
-    AttentionConfig cfg{2, 8, 32, 64, 128, false};
+    AttentionConfig cfg{2, 8, 32, 64, false};
     const size_t bytes = element_count(cfg) * sizeof(float);
 
     std::printf("Testing multi-head + batch attention\n");
