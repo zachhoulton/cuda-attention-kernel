@@ -2,6 +2,7 @@
 
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
 
 #define MAX_SEQ_LEN 256
 #define KEY_TILE_SIZE 4
@@ -18,17 +19,20 @@ __global__ void flash_attention_kernel(
     int head_dim,
     bool causal) {
     
-    // Which query block and which query row within it
+    // blockIdx.x = query block, blockIdx.y = head, blockIdx.z = batch
+    const int batch_idx = blockIdx.z;
+    const int head_idx = blockIdx.y;
     const int query_block_start = blockIdx.x * QUERY_BLOCK_SIZE;
     const int query_offset_in_block = threadIdx.x / head_dim;
     const int output_dim = threadIdx.x % head_dim;
     const int query_index = query_block_start + query_offset_in_block;
     
     // Guard against launching more blocks/threads than needed
-    if (query_index >= seq_len || output_dim >= head_dim) {
+    if (batch_idx >= batch || head_idx >= heads || query_index >= seq_len || output_dim >= head_dim) {
         return;
     }
 
+    const size_t batch_head_offset = (size_t)batch_idx * heads * seq_len * head_dim + (size_t)head_idx * seq_len * head_dim;
     const int query_offset = query_index * head_dim;
     float running_max = -FLT_MAX;
     float running_sum = 0.0f;
@@ -52,7 +56,7 @@ __global__ void flash_attention_kernel(
             const int tile_row = tile_index / head_dim;
             const int tile_dim = tile_index % head_dim;
             const int key_index = tile_start + tile_row;
-            const int global_offset = key_index * head_dim + tile_dim;
+            const int global_offset = batch_head_offset + key_index * head_dim + tile_dim;
 
             if (key_index < tile_end) {
                 shared_k[tile_index] = k[global_offset];
@@ -74,7 +78,7 @@ __global__ void flash_attention_kernel(
             float score = 0.0f;
             const int tile_row = key_index - tile_start;
             for (int d = 0; d < head_dim; ++d) {
-                score += q[query_offset + d] * shared_k[tile_row * head_dim + d];
+                score += q[batch_head_offset + query_offset + d] * shared_k[tile_row * head_dim + d];
             }
 
             score /= sqrtf(static_cast<float>(head_dim));
@@ -97,7 +101,7 @@ __global__ void flash_attention_kernel(
             float score = 0.0f;
             const int tile_row = key_index - tile_start;
             for (int d = 0; d < head_dim; ++d) {
-                score += q[query_offset + d] * shared_k[tile_row * head_dim + d];
+                score += q[batch_head_offset + query_offset + d] * shared_k[tile_row * head_dim + d];
             }
 
             score /= sqrtf(static_cast<float>(head_dim));
@@ -114,7 +118,7 @@ __global__ void flash_attention_kernel(
         __syncthreads();
     }
 
-    out[query_offset + output_dim] = weighted_value / running_sum;
+    out[batch_head_offset + query_offset + output_dim] = weighted_value / running_sum;
 }
 
 // Host-side launcher for forward pass
@@ -125,9 +129,6 @@ void flash_attention_forward(
     float* d_out,
     const AttentionConfig& config) {
 
-    if (config.batch != 1 || config.heads != 1) {
-        throw std::invalid_argument("The first kernel supports batch=1 and heads=1 only");
-    }
     if (config.seq_len > MAX_SEQ_LEN) {
         throw std::invalid_argument("seq_len exceeds MAX_SEQ_LEN");
     }
@@ -135,13 +136,15 @@ void flash_attention_forward(
         throw std::invalid_argument("head_dim exceeds the CUDA block thread limit");
     }
 
-    const int blocks = (config.seq_len + QUERY_BLOCK_SIZE - 1) / QUERY_BLOCK_SIZE;
+    const int query_blocks = (config.seq_len + QUERY_BLOCK_SIZE - 1) / QUERY_BLOCK_SIZE;
     const int threads_per_block = QUERY_BLOCK_SIZE * config.head_dim;
+    const dim3 grid(query_blocks, config.heads, config.batch);
+    
     // 2 * because storing both K and V tiles
     const size_t shared_bytes =
         2 * KEY_TILE_SIZE * config.head_dim * sizeof(float);
 
-    flash_attention_kernel<<<blocks, threads_per_block, shared_bytes>>>( 
+    flash_attention_kernel<<<grid, threads_per_block, shared_bytes>>>( 
         d_q,
         d_k,
         d_v,
@@ -157,8 +160,14 @@ void flash_attention_forward(
 }
 
 int main() {
-    AttentionConfig cfg{1, 1, 8, 16, 128, false};
+    AttentionConfig cfg{2, 8, 32, 64, 128, false};
     const size_t bytes = element_count(cfg) * sizeof(float);
+
+    std::printf("Testing multi-head + batch attention\n");
+    std::printf("  batch=%d, heads=%d, seq_len=%d, head_dim=%d\n", 
+                cfg.batch, cfg.heads, cfg.seq_len, cfg.head_dim);
+    std::printf("  total elements: %zu\n", element_count(cfg));
+    std::printf("  total bytes: %.2f MB\n", bytes / 1e6);
 
     float* h_q = (float*)malloc(bytes);
     float* h_k = (float*)malloc(bytes);
@@ -177,36 +186,54 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_v, bytes));
     CUDA_CHECK(cudaMalloc(&d_out, bytes));
 
-    // Test 1: Non-causal attention
+    // Test 1: Non-causal attention 
     CUDA_CHECK(cudaMemcpy(d_q, h_q, bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_k, h_k, bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_v, h_v, bytes, cudaMemcpyHostToDevice));
 
+    std::printf("\nRunning non-causal attention...\n");
     flash_attention_forward(d_q, d_k, d_v, d_out, cfg);
 
     CUDA_CHECK(cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost));
 
-    std::printf("TEST_NONCAUSAL_OUTPUT_START\n");
-    for (int i = 0; i < cfg.seq_len * cfg.head_dim; i++) {
-        std::printf("%.8f ", h_out[i]);
+    // Save non-causal output to file for validation
+    FILE* f_noncausal = fopen("build/attention_noncausal.bin", "wb");
+    if (f_noncausal) {
+        fwrite(h_out, sizeof(float), element_count(cfg), f_noncausal);
+        fclose(f_noncausal);
+        std::printf("Saved non-causal output to build/attention_noncausal.bin\n");
+    }
+
+    std::printf("Non-causal output sample (batch=0, head=0, tokens 0-3):\n");
+    for (int i = 0; i < 4 * cfg.head_dim; i++) {
+        std::printf("%.6f ", h_out[i]);
         if ((i + 1) % cfg.head_dim == 0) std::printf("\n");
     }
-    std::printf("TEST_NONCAUSAL_OUTPUT_END\n");
 
     // Test 2: Causal attention
     cfg.causal = true;
     float* h_out_causal = (float*)malloc(bytes);
 
+    std::printf("\nRunning causal attention...\n");
     flash_attention_forward(d_q, d_k, d_v, d_out, cfg);
 
     CUDA_CHECK(cudaMemcpy(h_out_causal, d_out, bytes, cudaMemcpyDeviceToHost));
 
-    std::printf("TEST_CAUSAL_OUTPUT_START\n");
-    for (int i = 0; i < cfg.seq_len * cfg.head_dim; i++) {
-        std::printf("%.8f ", h_out_causal[i]);
+    // Save causal output to file for validation
+    FILE* f_causal = fopen("build/attention_causal.bin", "wb");
+    if (f_causal) {
+        fwrite(h_out_causal, sizeof(float), element_count(cfg), f_causal);
+        fclose(f_causal);
+        std::printf("Saved causal output to build/attention_causal.bin\n");
+    }
+
+    std::printf("Causal output sample (batch=0, head=0, tokens 0-3):\n");
+    for (int i = 0; i < 4 * cfg.head_dim; i++) {
+        std::printf("%.6f ", h_out_causal[i]);
         if ((i + 1) % cfg.head_dim == 0) std::printf("\n");
     }
-    std::printf("TEST_CAUSAL_OUTPUT_END\n");
+
+    std::printf("\n✓ Multi-head + batch attention kernel executed successfully!\n");
 
     cudaFree(d_q);
     cudaFree(d_k);
