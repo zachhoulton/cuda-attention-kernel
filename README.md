@@ -1,13 +1,12 @@
 # Flash Attention in CUDA
 
-This is a  CUDA implementation of FlashAttention, which is the attention algorithm behind most modern transformers.. It includes a full forward and backward pass, multi-head/batch support, and
+This is a CUDA implementation of FlashAttention, which is the attention algorithm behind most modern transformers. It includes a full forward and backward pass, multi-head/batch support, and
 fp32/fp16/bf16 precision.
  
 ## What's Included
 
 - Implementation of tiled online-softmax attention, with forward and backward passes
 - Reading of GPU profiler output (`nsight-compute`) and turning it into measured fixes
-
 - Correctness testing against PyTorch autograd across dtypes (fp32/fp16/bf16) and causal/non-causal masking
 - Performance framing: knowing  why a hand-written kernel is slower than a production one
 
@@ -31,7 +30,7 @@ attention matrix's gradient.
 
 ## Performance engineering
 
-Three `nsight-compute` profiling passes drove three  fixes:
+Three `nsight-compute` profiling passes drove three fixes:
 
 ![Performance tuning](assets/tuning_journey.png)
 
@@ -66,7 +65,7 @@ SDPA is 14–43x faster and plateaus right at the A100's fp32 roofline (~19.5 TF
 Forward, backward, and the delta-precompute kernels are templated on `scalar_t` (`float`/`__half`/
 `__nv_bfloat16`). All arithmetic stays in fp32 internally regardless of storage dtype; only the final writes
 narrow to the storage type. `tests/test_attention_precision.py` validates fp16/bf16 against a PyTorch
-reference rounded through the same dtype, at a loosened tolerance..
+reference rounded through the same dtype, at a loosened tolerance.
 
 ## Repo structure
 
