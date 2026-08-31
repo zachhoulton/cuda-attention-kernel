@@ -188,9 +188,10 @@ template void flash_attention_forward<__nv_bfloat16>(const __nv_bfloat16*, const
 
 // delta_i = dOut_i . Out_i
 // Needed by the backward kernel to turn dP into dS without re-deriving the full P matrix
+template <typename scalar_t>
 __global__ void compute_delta_kernel(
-    const float* d_out,
-    const float* out,
+    const scalar_t* d_out,
+    const scalar_t* out,
     float* delta,
     int batch,
     int heads,
@@ -206,15 +207,16 @@ __global__ void compute_delta_kernel(
     const size_t row_offset = (size_t)row * head_dim;
     float sum = 0.0f;
     for (int d = 0; d < head_dim; ++d) {
-        sum += d_out[row_offset + d] * out[row_offset + d];
+        sum += to_float(d_out[row_offset + d]) * to_float(out[row_offset + d]);
     }
     delta[row] = sum;
 }
 
 // Host-side launcher for the delta_i = dOut_i . Out_i precompute step
+template <typename scalar_t>
 void compute_delta(
-    const float* d_dout,
-    const float* d_out,
+    const scalar_t* d_dout,
+    const scalar_t* d_out,
     float* d_delta,
     const AttentionConfig& config) {
 
@@ -222,7 +224,7 @@ void compute_delta(
     const int threads = 256;
     const int blocks = ceil_div(total_rows, threads);
 
-    compute_delta_kernel<<<blocks, threads>>>(
+    compute_delta_kernel<scalar_t><<<blocks, threads>>>(
         d_dout,
         d_out,
         d_delta,
@@ -235,16 +237,21 @@ void compute_delta(
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
+template void compute_delta<float>(const float*, const float*, float*, const AttentionConfig&);
+template void compute_delta<__half>(const __half*, const __half*, float*, const AttentionConfig&);
+template void compute_delta<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, float*, const AttentionConfig&);
+
+template <typename scalar_t>
 __global__ void flash_attention_backward_kernel(
-    const float* q,
-    const float* k,
-    const float* v,
-    const float* dout,
+    const scalar_t* q,
+    const scalar_t* k,
+    const scalar_t* v,
+    const scalar_t* dout,
     const float* logsumexp,
     const float* delta,
-    float* dq,
-    float* dk,
-    float* dv,
+    scalar_t* dq,
+    scalar_t* dk,
+    scalar_t* dv,
     int batch,
     int heads,
     int seq_len,
@@ -273,19 +280,19 @@ __global__ void flash_attention_backward_kernel(
     const float delta_i = is_valid_query ? delta[lse_row_offset + query_index] : 0.0f;
 
     extern __shared__ unsigned char shared_mem_raw[];
-    float* shared_q = reinterpret_cast<float*>(shared_mem_raw);
-    float* shared_dout = shared_q + QUERY_BLOCK_SIZE * head_dim;
-    float* shared_k = shared_dout + QUERY_BLOCK_SIZE * head_dim;
-    float* shared_v = shared_k + KEY_TILE_SIZE * head_dim;
-    float* shared_dk = shared_v + KEY_TILE_SIZE * head_dim;
+    scalar_t* shared_q = reinterpret_cast<scalar_t*>(shared_mem_raw);
+    scalar_t* shared_dout = shared_q + QUERY_BLOCK_SIZE * head_dim;
+    scalar_t* shared_k = shared_dout + QUERY_BLOCK_SIZE * head_dim;
+    scalar_t* shared_v = shared_k + KEY_TILE_SIZE * head_dim;
+    float* shared_dk = reinterpret_cast<float*>(shared_v + KEY_TILE_SIZE * head_dim);
     float* shared_dv = shared_dk + KEY_TILE_SIZE * head_dim;
 
     shared_q[threadIdx.x] = is_valid_query
         ? q[batch_head_offset + query_offset + output_dim]
-        : 0.0f;
+        : scalar_t(0.0f);
     shared_dout[threadIdx.x] = is_valid_query
         ? dout[batch_head_offset + query_offset + output_dim]
-        : 0.0f;
+        : scalar_t(0.0f);
     __syncthreads();
 
     // Accumulated raw (pre-1/sqrt(d)) and scaled once when written out below
@@ -309,8 +316,8 @@ __global__ void flash_attention_backward_kernel(
                 shared_k[tile_index] = k[global_offset];
                 shared_v[tile_index] = v[global_offset];
             } else {
-                shared_k[tile_index] = 0.0f;
-                shared_v[tile_index] = 0.0f;
+                shared_k[tile_index] = scalar_t(0.0f);
+                shared_v[tile_index] = scalar_t(0.0f);
             }
             shared_dk[tile_index] = 0.0f;
             shared_dv[tile_index] = 0.0f;
@@ -318,10 +325,10 @@ __global__ void flash_attention_backward_kernel(
         __syncthreads();
 
         if (is_valid_query) {
-            const float* my_q = shared_q + query_offset_in_block * head_dim;
-            const float* my_dout = shared_dout + query_offset_in_block * head_dim;
-            const float my_q_d = shared_q[threadIdx.x];
-            const float my_dout_d = shared_dout[threadIdx.x];
+            const scalar_t* my_q = shared_q + query_offset_in_block * head_dim;
+            const scalar_t* my_dout = shared_dout + query_offset_in_block * head_dim;
+            const float my_q_d = to_float(shared_q[threadIdx.x]);
+            const float my_dout_d = to_float(shared_dout[threadIdx.x]);
 
             for (int key_index = tile_start; key_index < tile_end; ++key_index) {
                 if (causal && key_index > query_index) {
@@ -333,7 +340,7 @@ __global__ void flash_attention_backward_kernel(
                 // Recompute S_ij and P_ij = exp(S_ij - lse_i) instead of storing the full matrix
                 float score = 0.0f;
                 for (int d = 0; d < head_dim; ++d) {
-                    score += my_q[d] * shared_k[tile_row * head_dim + d];
+                    score += to_float(my_q[d]) * to_float(shared_k[tile_row * head_dim + d]);
                 }
                 score /= sqrtf(static_cast<float>(head_dim));
                 const float p = expf(score - lse_i);
@@ -341,12 +348,12 @@ __global__ void flash_attention_backward_kernel(
                 // dP_ij = dOut_i . V_j, dS_ij = P_ij * (dP_ij - delta_i)
                 float dp = 0.0f;
                 for (int d = 0; d < head_dim; ++d) {
-                    dp += my_dout[d] * shared_v[tile_row * head_dim + d];
+                    dp += to_float(my_dout[d]) * to_float(shared_v[tile_row * head_dim + d]);
                 }
                 const float ds = p * (dp - delta_i);
 
                 // dQ_i[d] = (1/sqrt(d)) * sum_j dS_ij * K_j[d]
-                dq_accum += ds * shared_k[tile_row * head_dim + output_dim];
+                dq_accum += ds * to_float(shared_k[tile_row * head_dim + output_dim]);
 
                 // dV_j[d] = sum_i P_ij * dOut_i[d]; dK_j[d] = (1/sqrt(d)) * sum_i dS_ij * Q_i[d]
                 atomicAdd(&shared_dv[tile_row * head_dim + output_dim], p * my_dout_d);
@@ -365,29 +372,30 @@ __global__ void flash_attention_backward_kernel(
 
             if (key_index < tile_end) {
                 const int global_offset = batch_head_offset + key_index * head_dim + tile_dim;
-                atomicAdd(&dk[global_offset], shared_dk[tile_index] * inv_sqrt_d);
-                atomicAdd(&dv[global_offset], shared_dv[tile_index]);
+                atomicAdd(&dk[global_offset], from_float<scalar_t>(shared_dk[tile_index] * inv_sqrt_d));
+                atomicAdd(&dv[global_offset], from_float<scalar_t>(shared_dv[tile_index]));
             }
         }
         __syncthreads();
     }
 
     if (is_valid_query) {
-        dq[batch_head_offset + query_offset + output_dim] = dq_accum * inv_sqrt_d;
+        dq[batch_head_offset + query_offset + output_dim] = from_float<scalar_t>(dq_accum * inv_sqrt_d);
     }
 }
 
 // Host-side launcher for the backward pass
+template <typename scalar_t>
 void flash_attention_backward(
-    const float* d_q,
-    const float* d_k,
-    const float* d_v,
-    const float* d_dout,
+    const scalar_t* d_q,
+    const scalar_t* d_k,
+    const scalar_t* d_v,
+    const scalar_t* d_dout,
     const float* d_logsumexp,
     const float* d_delta,
-    float* d_dq,
-    float* d_dk,
-    float* d_dv,
+    scalar_t* d_dq,
+    scalar_t* d_dk,
+    scalar_t* d_dv,
     const AttentionConfig& config) {
 
     if (config.seq_len > MAX_SEQ_LEN) {
@@ -402,15 +410,16 @@ void flash_attention_backward(
     const dim3 grid(query_blocks, config.heads, config.batch);
 
     // dK/dV are accumulated across query blocks via atomicAdd, so they must start at zero
-    const size_t bytes = element_count(config) * sizeof(float);
+    const size_t bytes = element_count(config) * sizeof(scalar_t);
     CUDA_CHECK(cudaMemset(d_dk, 0, bytes));
     CUDA_CHECK(cudaMemset(d_dv, 0, bytes));
 
     // Q and dOut tiles, K and V tiles, dK and dV accumulator tiles
     const size_t shared_bytes =
-        (2 * QUERY_BLOCK_SIZE + 4 * KEY_TILE_SIZE) * config.head_dim * sizeof(float);
+        (2 * QUERY_BLOCK_SIZE + 2 * KEY_TILE_SIZE) * config.head_dim * sizeof(scalar_t)
+        + 2 * KEY_TILE_SIZE * config.head_dim * sizeof(float);
 
-    flash_attention_backward_kernel<<<grid, threads_per_block, shared_bytes>>>(
+    flash_attention_backward_kernel<scalar_t><<<grid, threads_per_block, shared_bytes>>>(
         d_q,
         d_k,
         d_v,
@@ -429,6 +438,10 @@ void flash_attention_backward(
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 }
+
+template void flash_attention_backward<float>(const float*, const float*, const float*, const float*, const float*, const float*, float*, float*, float*, const AttentionConfig&);
+template void flash_attention_backward<__half>(const __half*, const __half*, const __half*, const __half*, const float*, const float*, __half*, __half*, __half*, const AttentionConfig&);
+template void flash_attention_backward<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, const float*, const float*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, const AttentionConfig&);
 
 int main() {
     AttentionConfig cfg{2, 8, 32, 64, false};
