@@ -104,6 +104,8 @@ __global__ void flash_attention_backward_kernel(
     scalar_t* shared_v = shared_k + KEY_TILE_SIZE * head_dim;
     float* shared_dk = reinterpret_cast<float*>(shared_v + KEY_TILE_SIZE * head_dim);
     float* shared_dv = shared_dk + KEY_TILE_SIZE * head_dim;
+    float* shared_scores = shared_dv + KEY_TILE_SIZE * head_dim;
+    float* shared_dp = shared_scores + QUERY_BLOCK_SIZE * KEY_TILE_SIZE;
 
     shared_q[threadIdx.x] = is_valid_query
         ? q[batch_head_offset + query_offset + output_dim]
@@ -142,11 +144,32 @@ __global__ void flash_attention_backward_kernel(
         }
         __syncthreads();
 
+        // S_ij/dP_ij don't depend on output_dim, so only one thread per key computes them
+        const int tile_size = tile_end - tile_start;
+        if (is_valid_query && output_dim < tile_size) {
+            const int tile_row = output_dim;
+            const int key_index = tile_start + tile_row;
+            if (!causal || key_index <= query_index) {
+                const scalar_t* my_q = shared_q + query_offset_in_block * head_dim;
+                const scalar_t* my_dout = shared_dout + query_offset_in_block * head_dim;
+                float score = 0.0f;
+                float dp = 0.0f;
+                for (int d = 0; d < head_dim; ++d) {
+                    score += to_float(my_q[d]) * to_float(shared_k[tile_row * head_dim + d]);
+                    dp += to_float(my_dout[d]) * to_float(shared_v[tile_row * head_dim + d]);
+                }
+                const int slot = query_offset_in_block * KEY_TILE_SIZE + tile_row;
+                shared_scores[slot] = score / sqrtf(static_cast<float>(head_dim));
+                shared_dp[slot] = dp;
+            }
+        }
+        __syncthreads();
+
         if (is_valid_query) {
-            const scalar_t* my_q = shared_q + query_offset_in_block * head_dim;
-            const scalar_t* my_dout = shared_dout + query_offset_in_block * head_dim;
             const float my_q_d = to_float(shared_q[threadIdx.x]);
             const float my_dout_d = to_float(shared_dout[threadIdx.x]);
+            const float* my_scores = shared_scores + query_offset_in_block * KEY_TILE_SIZE;
+            const float* my_dp = shared_dp + query_offset_in_block * KEY_TILE_SIZE;
 
             for (int key_index = tile_start; key_index < tile_end; ++key_index) {
                 if (causal && key_index > query_index) {
@@ -155,20 +178,11 @@ __global__ void flash_attention_backward_kernel(
 
                 const int tile_row = key_index - tile_start;
 
-                // Recompute S_ij and P_ij = exp(S_ij - lse_i) instead of storing the full matrix
-                float score = 0.0f;
-                for (int d = 0; d < head_dim; ++d) {
-                    score += to_float(my_q[d]) * to_float(shared_k[tile_row * head_dim + d]);
-                }
-                score /= sqrtf(static_cast<float>(head_dim));
-                const float p = expf(score - lse_i);
+                // P_ij = exp(S_ij - lse_i) using the cached S_ij instead of storing the full matrix
+                const float p = expf(my_scores[tile_row] - lse_i);
 
-                // dP_ij = dOut_i . V_j, dS_ij = P_ij * (dP_ij - delta_i)
-                float dp = 0.0f;
-                for (int d = 0; d < head_dim; ++d) {
-                    dp += to_float(my_dout[d]) * to_float(shared_v[tile_row * head_dim + d]);
-                }
-                const float ds = p * (dp - delta_i);
+                // dS_ij = P_ij * (dP_ij - delta_i)
+                const float ds = p * (my_dp[tile_row] - delta_i);
 
                 // dQ_i[d] = (1/sqrt(d)) * sum_j dS_ij * K_j[d]
                 dq_accum += ds * to_float(shared_k[tile_row * head_dim + output_dim]);
@@ -232,10 +246,11 @@ void flash_attention_backward(
     CUDA_CHECK(cudaMemset(d_dk, 0, bytes));
     CUDA_CHECK(cudaMemset(d_dv, 0, bytes));
 
-    // Q and dOut tiles, K and V tiles, dK and dV accumulator tiles
+    // Q and dOut tiles, K and V tiles, dK and dV accumulator tiles, plus cached S_ij/dP_ij scores
     const size_t shared_bytes =
         (2 * QUERY_BLOCK_SIZE + 2 * KEY_TILE_SIZE) * config.head_dim * sizeof(scalar_t)
-        + 2 * KEY_TILE_SIZE * config.head_dim * sizeof(float);
+        + 2 * KEY_TILE_SIZE * config.head_dim * sizeof(float)
+        + 2 * QUERY_BLOCK_SIZE * KEY_TILE_SIZE * sizeof(float);
 
     flash_attention_backward_kernel<scalar_t><<<grid, threads_per_block, shared_bytes>>>(
         d_q,

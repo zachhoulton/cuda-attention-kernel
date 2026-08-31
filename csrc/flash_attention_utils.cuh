@@ -109,6 +109,7 @@ __global__ void flash_attention_kernel(
     scalar_t* shared_q = reinterpret_cast<scalar_t*>(shared_mem_raw);
     scalar_t* shared_k = shared_q + QUERY_BLOCK_SIZE * head_dim;
     scalar_t* shared_v = shared_k + KEY_TILE_SIZE * head_dim;
+    float* shared_scores = reinterpret_cast<float*>(shared_v + KEY_TILE_SIZE * head_dim);
 
     shared_q[threadIdx.x] = is_valid_query
         ? q[batch_head_offset + query_offset + output_dim]
@@ -141,21 +142,31 @@ __global__ void flash_attention_kernel(
         // Wait until entire tile is written before it's read from
         __syncthreads();
 
+        // S_ij doesn't depend on output_dim, so only one thread per key computes it
+        const int tile_size = tile_end - tile_start;
+        if (is_valid_query && output_dim < tile_size) {
+            const int tile_row = output_dim;
+            const int key_index = tile_start + tile_row;
+            if (!causal || key_index <= query_index) {
+                const scalar_t* my_q = shared_q + query_offset_in_block * head_dim;
+                float score = 0.0f;
+                for (int d = 0; d < head_dim; ++d) {
+                    score += to_float(my_q[d]) * to_float(shared_k[tile_row * head_dim + d]);
+                }
+                shared_scores[query_offset_in_block * KEY_TILE_SIZE + tile_row] = score / sqrtf(static_cast<float>(head_dim));
+            }
+        }
+        __syncthreads();
+
         if (is_valid_query) {
-            const scalar_t* my_q = shared_q + query_offset_in_block * head_dim;
+            const float* my_scores = shared_scores + query_offset_in_block * KEY_TILE_SIZE;
             float tile_max = -FLT_MAX;
             for (int key_index = tile_start; key_index < tile_end; ++key_index) {
                 if (causal && key_index > query_index) {
                     continue;
                 }
 
-                float score = 0.0f;
-                const int tile_row = key_index - tile_start;
-                for (int d = 0; d < head_dim; ++d) {
-                    score += to_float(my_q[d]) * to_float(shared_k[tile_row * head_dim + d]);
-                }
-
-                score /= sqrtf(static_cast<float>(head_dim));
+                const float score = my_scores[key_index - tile_start];
                 if (score > tile_max) {
                     tile_max = score;
                 }
@@ -172,14 +183,8 @@ __global__ void flash_attention_kernel(
                     continue;
                 }
 
-                float score = 0.0f;
                 const int tile_row = key_index - tile_start;
-                for (int d = 0; d < head_dim; ++d) {
-                    score += to_float(my_q[d]) * to_float(shared_k[tile_row * head_dim + d]);
-                }
-
-                score /= sqrtf(static_cast<float>(head_dim));
-                const float weight = expf(score - new_max);
+                const float weight = expf(my_scores[tile_row] - new_max);
                 tile_sum += weight;
                 tile_weighted_value += weight * to_float(shared_v[tile_row * head_dim + output_dim]);
             }
@@ -225,9 +230,10 @@ void flash_attention_forward(
     }
     const dim3 grid(query_blocks, config.heads, config.batch);
 
-    // One tile each for Q, K, and V
+    // One tile each for Q, K, and V, plus the cached S_ij scores per (query, key-in-tile)
     const size_t shared_bytes =
-        (QUERY_BLOCK_SIZE + 2 * KEY_TILE_SIZE) * config.head_dim * sizeof(scalar_t);
+        (QUERY_BLOCK_SIZE + 2 * KEY_TILE_SIZE) * config.head_dim * sizeof(scalar_t)
+        + QUERY_BLOCK_SIZE * KEY_TILE_SIZE * sizeof(float);
 
     flash_attention_kernel<scalar_t><<<grid, threads_per_block, shared_bytes>>>( 
         d_q,
