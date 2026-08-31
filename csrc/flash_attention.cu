@@ -227,6 +227,7 @@ void compute_delta(
 
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
+}
 
 __global__ void flash_attention_backward_kernel(
     const float* q,
