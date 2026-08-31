@@ -14,6 +14,7 @@ __global__ void flash_attention_kernel(
     const float* k,
     const float* v,
     float* out,
+    float* logsumexp,
     int batch,
     int heads,
     int seq_len,
@@ -130,6 +131,12 @@ __global__ void flash_attention_kernel(
 
     if (is_valid_query) {
         out[batch_head_offset + query_offset + output_dim] = weighted_value / running_sum;
+
+        // Saved once per query so the backward pass can recompute P_ij = exp(S_ij - lse) directly
+        if (output_dim == 0) {
+            const size_t lse_index = (size_t)batch_idx * heads * seq_len + (size_t)head_idx * seq_len + query_index;
+            logsumexp[lse_index] = running_max + logf(running_sum);
+        }
     }
 }
 
@@ -139,6 +146,7 @@ void flash_attention_forward(
     const float* d_k,
     const float* d_v,
     float* d_out,
+    float* d_logsumexp,
     const AttentionConfig& config) {
 
     if (config.seq_len > MAX_SEQ_LEN) {
@@ -161,6 +169,7 @@ void flash_attention_forward(
         d_k,
         d_v,
         d_out,
+        d_logsumexp,
         config.batch,
         config.heads,
         config.seq_len,
@@ -186,6 +195,9 @@ int main() {
     float* h_v = (float*)malloc(bytes);
     float* h_out = (float*)malloc(bytes);
 
+    const size_t lse_bytes = (size_t)cfg.batch * cfg.heads * cfg.seq_len * sizeof(float);
+    float* h_logsumexp = (float*)malloc(lse_bytes);
+
     for (size_t i = 0; i < element_count(cfg); ++i) {
         h_q[i] = 0.1f + 0.01f * (i % 100);
         h_k[i] = 0.2f + 0.02f * (i % 100);
@@ -198,15 +210,19 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_v, bytes));
     CUDA_CHECK(cudaMalloc(&d_out, bytes));
 
+    float* d_logsumexp;
+    CUDA_CHECK(cudaMalloc(&d_logsumexp, lse_bytes));
+
     // Test 1: Non-causal attention 
     CUDA_CHECK(cudaMemcpy(d_q, h_q, bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_k, h_k, bytes, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_v, h_v, bytes, cudaMemcpyHostToDevice));
 
     std::printf("\nRunning non-causal attention...\n");
-    flash_attention_forward(d_q, d_k, d_v, d_out, cfg);
+    flash_attention_forward(d_q, d_k, d_v, d_out, d_logsumexp, cfg);
 
     CUDA_CHECK(cudaMemcpy(h_out, d_out, bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_logsumexp, d_logsumexp, lse_bytes, cudaMemcpyDeviceToHost));
 
     // Save non-causal output to file for validation
     FILE* f_noncausal = fopen("build/attention_noncausal.bin", "wb");
@@ -214,6 +230,13 @@ int main() {
         fwrite(h_out, sizeof(float), element_count(cfg), f_noncausal);
         fclose(f_noncausal);
         std::printf("Saved non-causal output to build/attention_noncausal.bin\n");
+    }
+
+    FILE* f_lse_noncausal = fopen("build/logsumexp_noncausal.bin", "wb");
+    if (f_lse_noncausal) {
+        fwrite(h_logsumexp, sizeof(float), lse_bytes / sizeof(float), f_lse_noncausal);
+        fclose(f_lse_noncausal);
+        std::printf("Saved non-causal logsumexp to build/logsumexp_noncausal.bin\n");
     }
 
     std::printf("Non-causal output sample (batch=0, head=0, tokens 0-3):\n");
@@ -227,9 +250,10 @@ int main() {
     float* h_out_causal = (float*)malloc(bytes);
 
     std::printf("\nRunning causal attention...\n");
-    flash_attention_forward(d_q, d_k, d_v, d_out, cfg);
+    flash_attention_forward(d_q, d_k, d_v, d_out, d_logsumexp, cfg);
 
     CUDA_CHECK(cudaMemcpy(h_out_causal, d_out, bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_logsumexp, d_logsumexp, lse_bytes, cudaMemcpyDeviceToHost));
 
     // Save causal output to file for validation
     FILE* f_causal = fopen("build/attention_causal.bin", "wb");
@@ -237,6 +261,13 @@ int main() {
         fwrite(h_out_causal, sizeof(float), element_count(cfg), f_causal);
         fclose(f_causal);
         std::printf("Saved causal output to build/attention_causal.bin\n");
+    }
+
+    FILE* f_lse_causal = fopen("build/logsumexp_causal.bin", "wb");
+    if (f_lse_causal) {
+        fwrite(h_logsumexp, sizeof(float), lse_bytes / sizeof(float), f_lse_causal);
+        fclose(f_lse_causal);
+        std::printf("Saved causal logsumexp to build/logsumexp_causal.bin\n");
     }
 
     std::printf("Causal output sample (batch=0, head=0, tokens 0-3):\n");
@@ -251,11 +282,13 @@ int main() {
     cudaFree(d_k);
     cudaFree(d_v);
     cudaFree(d_out);
+    cudaFree(d_logsumexp);
     free(h_q);
     free(h_k);
     free(h_v);
     free(h_out);
     free(h_out_causal);
+    free(h_logsumexp);
 
     return 0;
 }
