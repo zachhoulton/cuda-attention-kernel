@@ -42,8 +42,8 @@ __global__ void flash_attention_kernel(
     float weighted_value = 0.0f;
 
     // __shared__ memory is shared by all threads within a block
-    extern __shared__ scalar_t shared_mem[];
-    scalar_t* shared_q = shared_mem;
+    extern __shared__ unsigned char shared_mem_raw[];
+    scalar_t* shared_q = reinterpret_cast<scalar_t*>(shared_mem_raw);
     scalar_t* shared_k = shared_q + QUERY_BLOCK_SIZE * head_dim;
     scalar_t* shared_v = shared_k + KEY_TILE_SIZE * head_dim;
 
@@ -272,8 +272,8 @@ __global__ void flash_attention_backward_kernel(
     const float lse_i = is_valid_query ? logsumexp[lse_row_offset + query_index] : 0.0f;
     const float delta_i = is_valid_query ? delta[lse_row_offset + query_index] : 0.0f;
 
-    extern __shared__ float shared_mem[];
-    float* shared_q = shared_mem;
+    extern __shared__ unsigned char shared_mem_raw[];
+    float* shared_q = reinterpret_cast<float*>(shared_mem_raw);
     float* shared_dout = shared_q + QUERY_BLOCK_SIZE * head_dim;
     float* shared_k = shared_dout + QUERY_BLOCK_SIZE * head_dim;
     float* shared_v = shared_k + KEY_TILE_SIZE * head_dim;
