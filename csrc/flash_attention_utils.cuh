@@ -67,10 +67,18 @@ inline size_t element_count(const AttentionConfig& cfg) {
     return static_cast<size_t>(cfg.batch) * cfg.heads * cfg.seq_len * cfg.head_dim;
 }
 
+#ifndef MAX_SEQ_LEN
 #define MAX_SEQ_LEN 8192
+#endif
+#ifndef KEY_TILE_SIZE
 #define KEY_TILE_SIZE 4
+#endif
+#ifndef QUERY_BLOCK_SIZE
 #define QUERY_BLOCK_SIZE 16
+#endif
+#ifndef MAX_THREADS_PER_BLOCK
 #define MAX_THREADS_PER_BLOCK 1024
+#endif
 
 template <typename scalar_t>
 __global__ void flash_attention_kernel(

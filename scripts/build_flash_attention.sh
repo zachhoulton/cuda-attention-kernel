@@ -18,6 +18,7 @@ nvcc \
   -O3 \
   -arch=sm_80 \
   -I. \
+  ${NVCC_DEFINES:-} \
   csrc/flash_attention.cu \
   -o build/flash_attention
 

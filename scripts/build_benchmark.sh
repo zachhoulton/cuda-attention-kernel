@@ -18,6 +18,7 @@ nvcc \
   -O3 \
   -arch=sm_80 \
   -I. \
+  ${NVCC_DEFINES:-} \
   benchmarks/bench_flash_attention.cu \
   -o build/bench_flash_attention
 
