@@ -71,7 +71,7 @@ inline size_t element_count(const AttentionConfig& cfg) {
 #define MAX_SEQ_LEN 8192
 #endif
 #ifndef KEY_TILE_SIZE
-#define KEY_TILE_SIZE 4
+#define KEY_TILE_SIZE 32
 #endif
 #ifndef QUERY_BLOCK_SIZE
 #define QUERY_BLOCK_SIZE 16
