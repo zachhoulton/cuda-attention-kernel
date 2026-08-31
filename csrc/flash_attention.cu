@@ -180,6 +180,249 @@ void flash_attention_forward(
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
+// delta_i = dOut_i . Out_i
+// Needed by the backward kernel to turn dP into dS without re-deriving the full P matrix
+__global__ void compute_delta_kernel(
+    const float* d_out,
+    const float* out,
+    float* delta,
+    int batch,
+    int heads,
+    int seq_len,
+    int head_dim) {
+
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total_rows = batch * heads * seq_len;
+    if (row >= total_rows) {
+        return;
+    }
+
+    const size_t row_offset = (size_t)row * head_dim;
+    float sum = 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+        sum += d_out[row_offset + d] * out[row_offset + d];
+    }
+    delta[row] = sum;
+}
+
+// Host-side launcher for the delta_i = dOut_i . Out_i precompute step
+void compute_delta(
+    const float* d_dout,
+    const float* d_out,
+    float* d_delta,
+    const AttentionConfig& config) {
+
+    const int total_rows = config.batch * config.heads * config.seq_len;
+    const int threads = 256;
+    const int blocks = ceil_div(total_rows, threads);
+
+    compute_delta_kernel<<<blocks, threads>>>(
+        d_dout,
+        d_out,
+        d_delta,
+        config.batch,
+        config.heads,
+        config.seq_len,
+        config.head_dim);
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+__global__ void flash_attention_backward_kernel(
+    const float* q,
+    const float* k,
+    const float* v,
+    const float* dout,
+    const float* logsumexp,
+    const float* delta,
+    float* dq,
+    float* dk,
+    float* dv,
+    int batch,
+    int heads,
+    int seq_len,
+    int head_dim,
+    bool causal) {
+
+    const int batch_idx = blockIdx.z;
+    const int head_idx = blockIdx.y;
+    const int query_block_start = blockIdx.x * QUERY_BLOCK_SIZE;
+    const int query_offset_in_block = threadIdx.x / head_dim;
+    const int output_dim = threadIdx.x % head_dim;
+    const int query_index = query_block_start + query_offset_in_block;
+
+    if (batch_idx >= batch || head_idx >= heads) {
+        return;
+    }
+    const bool is_valid_query = (query_index < seq_len);
+
+    const size_t batch_head_offset = (size_t)batch_idx * heads * seq_len * head_dim + (size_t)head_idx * seq_len * head_dim;
+    const size_t lse_row_offset = (size_t)batch_idx * heads * seq_len + (size_t)head_idx * seq_len;
+    const int query_offset = query_index * head_dim;
+    const float inv_sqrt_d = 1.0f / sqrtf(static_cast<float>(head_dim));
+
+    // Row-wide scalars saved by the forward pass
+    const float lse_i = is_valid_query ? logsumexp[lse_row_offset + query_index] : 0.0f;
+    const float delta_i = is_valid_query ? delta[lse_row_offset + query_index] : 0.0f;
+
+    extern __shared__ float shared_mem[];
+    float* shared_q = shared_mem;
+    float* shared_dout = shared_q + QUERY_BLOCK_SIZE * head_dim;
+    float* shared_k = shared_dout + QUERY_BLOCK_SIZE * head_dim;
+    float* shared_v = shared_k + KEY_TILE_SIZE * head_dim;
+    float* shared_dk = shared_v + KEY_TILE_SIZE * head_dim;
+    float* shared_dv = shared_dk + KEY_TILE_SIZE * head_dim;
+
+    shared_q[threadIdx.x] = is_valid_query
+        ? q[batch_head_offset + query_offset + output_dim]
+        : 0.0f;
+    shared_dout[threadIdx.x] = is_valid_query
+        ? dout[batch_head_offset + query_offset + output_dim]
+        : 0.0f;
+    __syncthreads();
+
+    // Accumulated raw (pre-1/sqrt(d)) and scaled once when written out below
+    float dq_accum = 0.0f;
+
+    for (int tile_start = 0; tile_start < seq_len; tile_start += KEY_TILE_SIZE) {
+        const int tile_end = (tile_start + KEY_TILE_SIZE < seq_len)
+            ? tile_start + KEY_TILE_SIZE
+            : seq_len;
+
+        // Load K/V for this tile and zero this tile's dK/dV accumulators
+        for (int tile_index = threadIdx.x;
+             tile_index < KEY_TILE_SIZE * head_dim;
+             tile_index += blockDim.x) {
+            const int tile_row = tile_index / head_dim;
+            const int tile_dim = tile_index % head_dim;
+            const int key_index = tile_start + tile_row;
+            const int global_offset = batch_head_offset + key_index * head_dim + tile_dim;
+
+            if (key_index < tile_end) {
+                shared_k[tile_index] = k[global_offset];
+                shared_v[tile_index] = v[global_offset];
+            } else {
+                shared_k[tile_index] = 0.0f;
+                shared_v[tile_index] = 0.0f;
+            }
+            shared_dk[tile_index] = 0.0f;
+            shared_dv[tile_index] = 0.0f;
+        }
+        __syncthreads();
+
+        if (is_valid_query) {
+            const float* my_q = shared_q + query_offset_in_block * head_dim;
+            const float* my_dout = shared_dout + query_offset_in_block * head_dim;
+            const float my_q_d = shared_q[threadIdx.x];
+            const float my_dout_d = shared_dout[threadIdx.x];
+
+            for (int key_index = tile_start; key_index < tile_end; ++key_index) {
+                if (causal && key_index > query_index) {
+                    continue;
+                }
+
+                const int tile_row = key_index - tile_start;
+
+                // Recompute S_ij and P_ij = exp(S_ij - lse_i) instead of storing the full matrix
+                float score = 0.0f;
+                for (int d = 0; d < head_dim; ++d) {
+                    score += my_q[d] * shared_k[tile_row * head_dim + d];
+                }
+                score /= sqrtf(static_cast<float>(head_dim));
+                const float p = expf(score - lse_i);
+
+                // dP_ij = dOut_i . V_j, dS_ij = P_ij * (dP_ij - delta_i)
+                float dp = 0.0f;
+                for (int d = 0; d < head_dim; ++d) {
+                    dp += my_dout[d] * shared_v[tile_row * head_dim + d];
+                }
+                const float ds = p * (dp - delta_i);
+
+                // dQ_i[d] = (1/sqrt(d)) * sum_j dS_ij * K_j[d]
+                dq_accum += ds * shared_k[tile_row * head_dim + output_dim];
+
+                // dV_j[d] = sum_i P_ij * dOut_i[d]; dK_j[d] = (1/sqrt(d)) * sum_i dS_ij * Q_i[d]
+                atomicAdd(&shared_dv[tile_row * head_dim + output_dim], p * my_dout_d);
+                atomicAdd(&shared_dk[tile_row * head_dim + output_dim], ds * my_q_d);
+            }
+        }
+        __syncthreads();
+
+        // Flush this tile's dK/dV contributions to global memory once per (query block, key tile)
+        for (int tile_index = threadIdx.x;
+             tile_index < KEY_TILE_SIZE * head_dim;
+             tile_index += blockDim.x) {
+            const int tile_row = tile_index / head_dim;
+            const int tile_dim = tile_index % head_dim;
+            const int key_index = tile_start + tile_row;
+
+            if (key_index < tile_end) {
+                const int global_offset = batch_head_offset + key_index * head_dim + tile_dim;
+                atomicAdd(&dk[global_offset], shared_dk[tile_index] * inv_sqrt_d);
+                atomicAdd(&dv[global_offset], shared_dv[tile_index]);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (is_valid_query) {
+        dq[batch_head_offset + query_offset + output_dim] = dq_accum * inv_sqrt_d;
+    }
+}
+
+// Host-side launcher for the backward pass
+void flash_attention_backward(
+    const float* d_q,
+    const float* d_k,
+    const float* d_v,
+    const float* d_dout,
+    const float* d_logsumexp,
+    const float* d_delta,
+    float* d_dq,
+    float* d_dk,
+    float* d_dv,
+    const AttentionConfig& config) {
+
+    if (config.seq_len > MAX_SEQ_LEN) {
+        throw std::invalid_argument("seq_len exceeds MAX_SEQ_LEN");
+    }
+
+    const int query_blocks = (config.seq_len + QUERY_BLOCK_SIZE - 1) / QUERY_BLOCK_SIZE;
+    const int threads_per_block = QUERY_BLOCK_SIZE * config.head_dim;
+    if (threads_per_block > MAX_THREADS_PER_BLOCK) {
+        throw std::invalid_argument("QUERY_BLOCK_SIZE * head_dim exceeds the CUDA max threads per block (1024)");
+    }
+    const dim3 grid(query_blocks, config.heads, config.batch);
+
+    // dK/dV are accumulated across query blocks via atomicAdd, so they must start at zero
+    const size_t bytes = element_count(config) * sizeof(float);
+    CUDA_CHECK(cudaMemset(d_dk, 0, bytes));
+    CUDA_CHECK(cudaMemset(d_dv, 0, bytes));
+
+    // Q and dOut tiles, K and V tiles, dK and dV accumulator tiles
+    const size_t shared_bytes =
+        (2 * QUERY_BLOCK_SIZE + 4 * KEY_TILE_SIZE) * config.head_dim * sizeof(float);
+
+    flash_attention_backward_kernel<<<grid, threads_per_block, shared_bytes>>>(
+        d_q,
+        d_k,
+        d_v,
+        d_dout,
+        d_logsumexp,
+        d_delta,
+        d_dq,
+        d_dk,
+        d_dv,
+        config.batch,
+        config.heads,
+        config.seq_len,
+        config.head_dim,
+        config.causal);
+
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
 int main() {
     AttentionConfig cfg{2, 8, 32, 64, false};
     const size_t bytes = element_count(cfg) * sizeof(float);
@@ -204,6 +447,14 @@ int main() {
         h_v[i] = 0.3f + 0.03f * (i % 100);
     }
 
+    float* h_dout = (float*)malloc(bytes);
+    float* h_dq = (float*)malloc(bytes);
+    float* h_dk = (float*)malloc(bytes);
+    float* h_dv = (float*)malloc(bytes);
+    for (size_t i = 0; i < element_count(cfg); ++i) {
+        h_dout[i] = 0.05f + 0.005f * (i % 100);
+    }
+
     float *d_q, *d_k, *d_v, *d_out;
     CUDA_CHECK(cudaMalloc(&d_q, bytes));
     CUDA_CHECK(cudaMalloc(&d_k, bytes));
@@ -212,6 +463,14 @@ int main() {
 
     float* d_logsumexp;
     CUDA_CHECK(cudaMalloc(&d_logsumexp, lse_bytes));
+
+    float *d_dout, *d_dq, *d_dk, *d_dv, *d_delta;
+    CUDA_CHECK(cudaMalloc(&d_dout, bytes));
+    CUDA_CHECK(cudaMalloc(&d_dq, bytes));
+    CUDA_CHECK(cudaMalloc(&d_dk, bytes));
+    CUDA_CHECK(cudaMalloc(&d_dv, bytes));
+    CUDA_CHECK(cudaMalloc(&d_delta, lse_bytes));
+    CUDA_CHECK(cudaMemcpy(d_dout, h_dout, bytes, cudaMemcpyHostToDevice));
 
     // Test 1: Non-causal attention 
     CUDA_CHECK(cudaMemcpy(d_q, h_q, bytes, cudaMemcpyHostToDevice));
@@ -245,6 +504,26 @@ int main() {
         if ((i + 1) % cfg.head_dim == 0) std::printf("\n");
     }
 
+    std::printf("\nRunning non-causal backward pass...\n");
+    compute_delta(d_dout, d_out, d_delta, cfg);
+    flash_attention_backward(d_q, d_k, d_v, d_dout, d_logsumexp, d_delta, d_dq, d_dk, d_dv, cfg);
+
+    CUDA_CHECK(cudaMemcpy(h_dq, d_dq, bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_dk, d_dk, bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_dv, d_dv, bytes, cudaMemcpyDeviceToHost));
+
+    auto save_grad = [&](const char* path, const float* data) {
+        FILE* f = fopen(path, "wb");
+        if (f) {
+            fwrite(data, sizeof(float), element_count(cfg), f);
+            fclose(f);
+            std::printf("Saved gradient to %s\n", path);
+        }
+    };
+    save_grad("build/dq_noncausal.bin", h_dq);
+    save_grad("build/dk_noncausal.bin", h_dk);
+    save_grad("build/dv_noncausal.bin", h_dv);
+
     // Test 2: Causal attention
     cfg.causal = true;
     float* h_out_causal = (float*)malloc(bytes);
@@ -276,6 +555,18 @@ int main() {
         if ((i + 1) % cfg.head_dim == 0) std::printf("\n");
     }
 
+    std::printf("\nRunning causal backward pass...\n");
+    compute_delta(d_dout, d_out, d_delta, cfg);
+    flash_attention_backward(d_q, d_k, d_v, d_dout, d_logsumexp, d_delta, d_dq, d_dk, d_dv, cfg);
+
+    CUDA_CHECK(cudaMemcpy(h_dq, d_dq, bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_dk, d_dk, bytes, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_dv, d_dv, bytes, cudaMemcpyDeviceToHost));
+
+    save_grad("build/dq_causal.bin", h_dq);
+    save_grad("build/dk_causal.bin", h_dk);
+    save_grad("build/dv_causal.bin", h_dv);
+
     std::printf("\n✓ Multi-head + batch attention kernel executed successfully!\n");
 
     cudaFree(d_q);
@@ -283,12 +574,21 @@ int main() {
     cudaFree(d_v);
     cudaFree(d_out);
     cudaFree(d_logsumexp);
+    cudaFree(d_dout);
+    cudaFree(d_dq);
+    cudaFree(d_dk);
+    cudaFree(d_dv);
+    cudaFree(d_delta);
     free(h_q);
     free(h_k);
     free(h_v);
     free(h_out);
     free(h_out_causal);
     free(h_logsumexp);
+    free(h_dout);
+    free(h_dq);
+    free(h_dk);
+    free(h_dv);
 
     return 0;
 }
