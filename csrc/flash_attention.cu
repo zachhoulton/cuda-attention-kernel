@@ -9,11 +9,12 @@
 #define QUERY_BLOCK_SIZE 16
 #define MAX_THREADS_PER_BLOCK 1024
 
+template <typename scalar_t>
 __global__ void flash_attention_kernel(
-    const float* q,
-    const float* k,
-    const float* v,
-    float* out,
+    const scalar_t* q,
+    const scalar_t* k,
+    const scalar_t* v,
+    scalar_t* out,
     float* logsumexp,
     int batch,
     int heads,
@@ -41,14 +42,14 @@ __global__ void flash_attention_kernel(
     float weighted_value = 0.0f;
 
     // __shared__ memory is shared by all threads within a block
-    extern __shared__ float shared_mem[];
-    float* shared_q = shared_mem;
-    float* shared_k = shared_q + QUERY_BLOCK_SIZE * head_dim;
-    float* shared_v = shared_k + KEY_TILE_SIZE * head_dim;
+    extern __shared__ scalar_t shared_mem[];
+    scalar_t* shared_q = shared_mem;
+    scalar_t* shared_k = shared_q + QUERY_BLOCK_SIZE * head_dim;
+    scalar_t* shared_v = shared_k + KEY_TILE_SIZE * head_dim;
 
     shared_q[threadIdx.x] = is_valid_query
         ? q[batch_head_offset + query_offset + output_dim]
-        : 0.0f;
+        : scalar_t(0.0f);
     __syncthreads();
 
     // Process one key/value tile at a time and merge its softmax stats
@@ -70,15 +71,15 @@ __global__ void flash_attention_kernel(
                 shared_k[tile_index] = k[global_offset];
                 shared_v[tile_index] = v[global_offset];
             } else {
-                shared_k[tile_index] = 0.0f;
-                shared_v[tile_index] = 0.0f;
+                shared_k[tile_index] = scalar_t(0.0f);
+                shared_v[tile_index] = scalar_t(0.0f);
             }
         }
         // Wait until entire tile is written before it's read from
         __syncthreads();
 
         if (is_valid_query) {
-            const float* my_q = shared_q + query_offset_in_block * head_dim;
+            const scalar_t* my_q = shared_q + query_offset_in_block * head_dim;
             float tile_max = -FLT_MAX;
             for (int key_index = tile_start; key_index < tile_end; ++key_index) {
                 if (causal && key_index > query_index) {
@@ -88,7 +89,7 @@ __global__ void flash_attention_kernel(
                 float score = 0.0f;
                 const int tile_row = key_index - tile_start;
                 for (int d = 0; d < head_dim; ++d) {
-                    score += my_q[d] * shared_k[tile_row * head_dim + d];
+                    score += to_float(my_q[d]) * to_float(shared_k[tile_row * head_dim + d]);
                 }
 
                 score /= sqrtf(static_cast<float>(head_dim));
@@ -111,13 +112,13 @@ __global__ void flash_attention_kernel(
                 float score = 0.0f;
                 const int tile_row = key_index - tile_start;
                 for (int d = 0; d < head_dim; ++d) {
-                    score += my_q[d] * shared_k[tile_row * head_dim + d];
+                    score += to_float(my_q[d]) * to_float(shared_k[tile_row * head_dim + d]);
                 }
 
                 score /= sqrtf(static_cast<float>(head_dim));
                 const float weight = expf(score - new_max);
                 tile_sum += weight;
-                tile_weighted_value += weight * shared_v[tile_row * head_dim + output_dim];
+                tile_weighted_value += weight * to_float(shared_v[tile_row * head_dim + output_dim]);
             }
 
             running_sum = previous_scale * running_sum + tile_sum;
@@ -130,7 +131,7 @@ __global__ void flash_attention_kernel(
     }
 
     if (is_valid_query) {
-        out[batch_head_offset + query_offset + output_dim] = weighted_value / running_sum;
+        out[batch_head_offset + query_offset + output_dim] = from_float<scalar_t>(weighted_value / running_sum);
 
         // Saved once per query so the backward pass can recompute P_ij = exp(S_ij - lse) directly
         if (output_dim == 0) {
@@ -141,11 +142,12 @@ __global__ void flash_attention_kernel(
 }
 
 // Host-side launcher for forward pass
+template <typename scalar_t>
 void flash_attention_forward(
-    const float* d_q,
-    const float* d_k,
-    const float* d_v,
-    float* d_out,
+    const scalar_t* d_q,
+    const scalar_t* d_k,
+    const scalar_t* d_v,
+    scalar_t* d_out,
     float* d_logsumexp,
     const AttentionConfig& config) {
 
@@ -162,9 +164,9 @@ void flash_attention_forward(
 
     // One tile each for Q, K, and V
     const size_t shared_bytes =
-        (QUERY_BLOCK_SIZE + 2 * KEY_TILE_SIZE) * config.head_dim * sizeof(float);
+        (QUERY_BLOCK_SIZE + 2 * KEY_TILE_SIZE) * config.head_dim * sizeof(scalar_t);
 
-    flash_attention_kernel<<<grid, threads_per_block, shared_bytes>>>( 
+    flash_attention_kernel<scalar_t><<<grid, threads_per_block, shared_bytes>>>( 
         d_q,
         d_k,
         d_v,
@@ -179,6 +181,10 @@ void flash_attention_forward(
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 }
+
+template void flash_attention_forward<float>(const float*, const float*, const float*, float*, float*, const AttentionConfig&);
+template void flash_attention_forward<__half>(const __half*, const __half*, const __half*, __half*, float*, const AttentionConfig&);
+template void flash_attention_forward<__nv_bfloat16>(const __nv_bfloat16*, const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, float*, const AttentionConfig&);
 
 // delta_i = dOut_i . Out_i
 // Needed by the backward kernel to turn dP into dS without re-deriving the full P matrix
