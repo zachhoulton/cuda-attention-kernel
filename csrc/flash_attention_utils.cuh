@@ -168,24 +168,39 @@ __global__ void flash_attention_kernel(
 
         if (is_valid_query) {
             const float* my_scores = shared_scores + query_offset_in_block * KEY_TILE_SIZE;
+            
+            float tile_max = -FLT_MAX;
+            for (int key_index = tile_start; key_index < tile_end; ++key_index) {
+                if (causal && key_index > query_index) {
+                    continue;
+                }
 
-            // Fold each key into the running softmax stats one at a time
+                const float score = my_scores[key_index - tile_start];
+                if (score > tile_max) {
+                    tile_max = score;
+                }
+            }
+
+            const float new_max = (running_max > tile_max) ? running_max : tile_max;
+            const float previous_scale =
+                (running_max == -FLT_MAX) ? 0.0f : expf(running_max - new_max);
+            float tile_sum = 0.0f;
+            float tile_weighted_value = 0.0f;
+
             for (int key_index = tile_start; key_index < tile_end; ++key_index) {
                 if (causal && key_index > query_index) {
                     continue;
                 }
 
                 const int tile_row = key_index - tile_start;
-                const float score = my_scores[tile_row];
-                const float new_max = (running_max > score) ? running_max : score;
-                const float correction =
-                    (running_max == -FLT_MAX) ? 0.0f : expf(running_max - new_max);
-                const float weight = expf(score - new_max);
-
-                running_sum = running_sum * correction + weight;
-                weighted_value = weighted_value * correction + weight * to_float(shared_v[tile_row * head_dim + output_dim]);
-                running_max = new_max;
+                const float weight = expf(my_scores[tile_row] - new_max);
+                tile_sum += weight;
+                tile_weighted_value += weight * to_float(shared_v[tile_row * head_dim + output_dim]);
             }
+
+            running_sum = previous_scale * running_sum + tile_sum;
+            weighted_value = previous_scale * weighted_value + tile_weighted_value;
+            running_max = new_max;
         }
 
         // All threads must finish reading before the next tile is loaded
