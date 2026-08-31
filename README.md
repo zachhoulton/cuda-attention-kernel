@@ -30,16 +30,16 @@ attention matrix's gradient.
 
 ## Performance engineering
 
-Three `nsight-compute` profiling passes drove three fixes:
+Three `nsight-compute` profiling passes drove key fixes:
 
 ![Performance tuning](assets/tuning_journey.png)
 
-**Baseline:** the profiler showed the SM at 91% busy but almost no useful throughput. The cause was every thread in a query row was redundantly
+**Redundant computation:** the profiler showed the SM at 91% busy but almost no useful throughput. The cause was every thread in a query row was redundantly
    recomputing the same `Q·K` dot product (up to 128x). To fix it, I computed each score once, and shared it
    via shared memory. 
 
 
-**Tile size sweep:** with the redundant math gone, the kernel became memory-bound from too many small tiles.
+**Choosing tile size:** with the redundant math gone, the kernel became memory-bound from too many small tiles.
    To fix it, I swept `KEY_TILE_SIZE` from 4 to 64 and picked 32, which was the best tradeoff between memory usage and performance.
 
 ## How far is this from production?
