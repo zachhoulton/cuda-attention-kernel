@@ -1,6 +1,6 @@
-# Flash Attention in CUDA
+# CUDA Attention Kernel
 
-This is a in-progress CUDA implementation of FlashAttention, which is the attention algorithm behind most modern transformers. It includes a full forward and backward pass, multi-head/batch support, and
+This is a in-progress CUDA implementation of an attention kernel, which utilizes the Flash Attention algorithm behind most modern transformers. It includes a full forward and backward pass, multi-head/batch support, and
 fp32/fp16/bf16 precision.
  
 ## What's Included
